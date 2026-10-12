@@ -14,7 +14,7 @@ required service-account permissions.
 Set the release version to install:
 
 ```sh
-export CAPSTK_VERSION=v0.1.0-alpha.2
+export CAPSTK_VERSION=v0.1.0-alpha.3
 ```
 
 Create `clusterctl.yaml` for that release:
