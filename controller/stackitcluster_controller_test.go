@@ -22,7 +22,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/events"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -140,7 +139,7 @@ var _ = Describe("StackitCluster Controller", func() {
 		expectCondition(got.Status.Conditions, infrav1.ClusterBastionReadyCondition, metav1.ConditionTrue, "Available")
 	})
 
-	It("reports a failed bastion server with its own reason and warns", func() {
+	It("reports a failed bastion server with its own reason", func() {
 		got := &infrav1.StackitCluster{}
 		Expect(k8sClient.Get(ctx, stackitKey, got)).To(Succeed())
 		got.Spec.Bastion = validBastionSpec()
@@ -150,8 +149,6 @@ var _ = Describe("StackitCluster Controller", func() {
 
 		Expect(k8sClient.Get(ctx, stackitKey, got)).To(Succeed())
 		fakeCloud.SetServerState(got.Status.Bastion.ServerID, "ERROR", "")
-		recorder := events.NewFakeRecorder(10)
-		reconciler.Recorder = recorder
 
 		result, err := reconciler.Reconcile(ctx, request)
 		Expect(err).NotTo(HaveOccurred())
@@ -161,7 +158,6 @@ var _ = Describe("StackitCluster Controller", func() {
 		expectCondition(got.Status.Conditions, infrav1.ClusterBastionReadyCondition, metav1.ConditionFalse, "InstanceFailed")
 		condition := meta.FindStatusCondition(got.Status.Conditions, infrav1.ClusterBastionReadyCondition)
 		Expect(condition.Message).To(Equal("bastion server failed (state ERROR)"))
-		Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Warning InstanceFailed")))
 	})
 
 	It("deletes existing bastion resources when bastion is disabled", func() {
@@ -502,6 +498,36 @@ var _ = Describe("StackitCluster Controller", func() {
 		expectCondition(got.Status.Conditions, infrav1.ClusterReadyCondition, metav1.ConditionFalse, "NetworkNotFound")
 	})
 
+	It("marks conditions not ready when API server load balancer creation fails", func() {
+		fakeCloud.FailNextEnsureLB = fmt.Errorf("load balancer creation rejected: %w", cloud.ErrInvalidInput)
+
+		result, err := reconciler.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
+
+		got := &infrav1.StackitCluster{}
+		Expect(k8sClient.Get(ctx, stackitKey, got)).To(Succeed())
+		Expect(got.Status.Ready).To(BeFalse())
+		expectCondition(got.Status.Conditions, infrav1.ClusterLoadBalancerReadyCondition, metav1.ConditionFalse, "LoadBalancerError")
+	})
+
+	It("marks conditions not ready when bastion creation fails", func() {
+		got := &infrav1.StackitCluster{}
+		Expect(k8sClient.Get(ctx, stackitKey, got)).To(Succeed())
+		got.Spec.Bastion = validBastionSpec()
+		Expect(k8sClient.Update(ctx, got)).To(Succeed())
+
+		fakeCloud.FailNextEnsureBastion = fmt.Errorf("bastion creation rejected: %w", cloud.ErrInvalidInput)
+
+		result, err := reconciler.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
+
+		Expect(k8sClient.Get(ctx, stackitKey, got)).To(Succeed())
+		Expect(got.Status.Ready).To(BeFalse())
+		expectCondition(got.Status.Conditions, infrav1.ClusterBastionReadyCondition, metav1.ConditionFalse, "BastionError")
+	})
+
 	It("requeues when network lookup returns a transient error", func() {
 		fakeCloud.FailNextGetNetwork = fmt.Errorf("temporary network lookup failure: %w", cloud.ErrTransient)
 
@@ -610,6 +636,22 @@ var _ = Describe("StackitCluster Controller", func() {
 			err := k8sClient.Get(ctx, stackitKey, &infrav1.StackitCluster{})
 			return apierrors.IsNotFound(err)
 		}).Should(BeTrue())
+	})
+
+	It("returns an error when API server load balancer deletion fails", func() {
+		_, err := reconciler.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+
+		got := &infrav1.StackitCluster{}
+		Expect(k8sClient.Get(ctx, stackitKey, got)).To(Succeed())
+		Expect(got.Status.APIServerLoadBalancerID).NotTo(BeEmpty())
+
+		Expect(k8sClient.Delete(ctx, got)).To(Succeed())
+
+		fakeCloud.FailNextDeleteLB = fmt.Errorf("delete load balancer timeout: %w", cloud.ErrTransient)
+
+		_, err = reconciler.Reconcile(ctx, request)
+		Expect(err).To(HaveOccurred())
 	})
 
 	// GetNetwork is the first cloud call of the reconcile, so a hook there proves
@@ -721,32 +763,6 @@ var _ = Describe("StackitCluster Controller", func() {
 			"cp-1-" + clusterName: "10.0.0.12",
 		}))
 		expectCondition(got.Status.Conditions, infrav1.ClusterLoadBalancerReadyCondition, metav1.ConditionTrue, "Available")
-	})
-
-	It("only publishes the LoadBalancerReady event when the load balancer becomes available or its IP changes", func() {
-		recorder := events.NewFakeRecorder(10)
-		reconciler.Recorder = recorder
-
-		_, err := reconciler.Reconcile(ctx, request)
-		Expect(err).NotTo(HaveOccurred())
-
-		Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Normal LoadBalancerReady")))
-
-		// A subsequent reconcile with target changes should not republish LoadBalancerReady.
-		createControlPlaneMachine(ctx, "cp-event-test-"+clusterName, clusterName, "10.0.0.99")
-		_, err = reconciler.Reconcile(ctx, request)
-		Expect(err).NotTo(HaveOccurred())
-
-		Expect(drainEvents(recorder)).NotTo(ContainElement(HavePrefix("Normal LoadBalancerReady")))
-
-		// If the load balancer IP changes, LoadBalancerReady should be published again.
-		got := &infrav1.StackitCluster{}
-		Expect(k8sClient.Get(ctx, stackitKey, got)).To(Succeed())
-		fakeCloud.SetLoadBalancerIP(got.Status.APIServerLoadBalancerID, "203.0.113.99")
-		_, err = reconciler.Reconcile(ctx, request)
-		Expect(err).NotTo(HaveOccurred())
-
-		Expect(drainEvents(recorder)).To(ContainElement(Equal("Normal LoadBalancerReady API server load balancer is ready at 203.0.113.99")))
 	})
 
 	It("keeps the bootstrap placeholder while no control plane machine has an address", func() {

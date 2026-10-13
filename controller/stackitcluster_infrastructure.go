@@ -12,16 +12,17 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util/collections"
+	"sigs.k8s.io/cluster-api/util/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -51,6 +52,8 @@ func (r *StackitClusterReconciler) reconcileNormal(ctx context.Context, clusterS
 
 	cloudClient, err := util.BuildCloudClient(ctx, r.Client, r.CloudClientFactory, stackitCluster)
 	if err != nil {
+		log.Error(err, "Failed to build cloud client for cluster", "cluster", stackitCluster.Name)
+		record.Warnf(stackitCluster, "InvalidCredentials", "Failed to build cloud client: %v", err)
 		stackitCluster.Status.Ready = false
 		return util.CredentialFailureResult(
 			&stackitCluster.Status.Conditions,
@@ -70,6 +73,15 @@ func (r *StackitClusterReconciler) reconcileNormal(ctx context.Context, clusterS
 
 	network, err := cloudClient.GetNetwork(ctx, stackitCluster.Spec.Network.ID)
 	if err != nil {
+		log.Error(err, "Failed to get network",
+			"networkID", stackitCluster.Spec.Network.ID,
+			"region", stackitCluster.Spec.Region,
+		)
+		record.Warnf(
+			stackitCluster, "FailedGetNetwork",
+			"Failed to get network %s in region %s: %v",
+			stackitCluster.Spec.Network.ID, stackitCluster.Spec.Region, err,
+		)
 		stackitCluster.Status.Ready = false
 		return util.CloudFailureResult(
 			&stackitCluster.Status.Conditions,
@@ -124,6 +136,14 @@ func (r *StackitClusterReconciler) reconcileNormal(ctx context.Context, clusterS
 			loadbalancerservice.APIServerInput(stackitCluster, seed),
 		)
 		if err != nil {
+			log.Error(err, "Failed to create API server load balancer",
+				"cluster", stackitCluster.Name,
+				"region", stackitCluster.Spec.Region,
+			)
+			record.Warnf(
+				stackitCluster, "FailedCreateLoadBalancer",
+				"Failed to create API server load balancer: %v", err,
+			)
 			stackitCluster.Status.Ready = false
 			return util.CloudFailureResult(
 				&stackitCluster.Status.Conditions,
@@ -139,9 +159,9 @@ func (r *StackitClusterReconciler) reconcileNormal(ctx context.Context, clusterS
 		hadLoadBalancerID := stackitCluster.Status.APIServerLoadBalancerID != ""
 		if loadBalancer != nil {
 			stackitCluster.Status.APIServerLoadBalancerID = loadBalancer.ID
-			if !hadLoadBalancerID && loadBalancer.ID != "" && r.Recorder != nil {
-				r.Recorder.Eventf(
-					stackitCluster, nil, corev1.EventTypeNormal, "LoadBalancerCreated", "Create",
+			if !hadLoadBalancerID && loadBalancer.ID != "" {
+				record.Eventf(
+					stackitCluster, "LoadBalancerCreated",
 					"Created API server load balancer %s", loadBalancer.ID,
 				)
 			}
@@ -169,9 +189,9 @@ func (r *StackitClusterReconciler) reconcileNormal(ctx context.Context, clusterS
 		// out every machine while the API server is still needed for drain.
 		if len(targets) > 0 {
 			if err := cloudClient.SetAPIServerLoadBalancerTargets(ctx, loadBalancer.ID, defaultAPIServerPort, targets); err != nil {
-				if !cloud.IsRetryable(err) && r.Recorder != nil {
-					r.Recorder.Eventf(
-						stackitCluster, nil, corev1.EventTypeWarning, "LoadBalancerTargetError", "Update",
+				if !cloud.IsRetryable(err) {
+					record.Warnf(
+						stackitCluster, "LoadBalancerTargetError",
 						"Cannot update API server load balancer target pool: %v", err,
 					)
 				}
@@ -199,12 +219,10 @@ func (r *StackitClusterReconciler) reconcileNormal(ctx context.Context, clusterS
 				"",
 				infrav1.ClusterLoadBalancerReadyCondition,
 			)
-			if r.Recorder != nil {
-				r.Recorder.Eventf(
-					stackitCluster, nil, corev1.EventTypeNormal, "LoadBalancerReady", "SetReady",
-					"API server load balancer is ready at %s", loadBalancer.IP,
-				)
-			}
+			record.Eventf(
+				stackitCluster, "LoadBalancerReady",
+				"API server load balancer is ready at %s", loadBalancer.IP,
+			)
 		}
 	} else if stackitCluster.Spec.ControlPlaneEndpoint.Host != "" {
 		stackitCluster.Status.APIServerEndpoint = stackitCluster.Spec.ControlPlaneEndpoint
@@ -215,6 +233,8 @@ func (r *StackitClusterReconciler) reconcileNormal(ctx context.Context, clusterS
 			infrav1.ClusterLoadBalancerReadyCondition,
 		)
 	} else {
+		log.Error(errors.New("controlPlaneEndpoint host is empty"), "API server load balancer is disabled and controlPlaneEndpoint is empty", "cluster", stackitCluster.Name)
+		record.Warn(stackitCluster, "EndpointMissing", "apiServerLoadBalancer.enabled is false and controlPlaneEndpoint is empty")
 		clusterScope.SetNotReady(
 			"EndpointMissing",
 			"apiServerLoadBalancer.enabled is false and controlPlaneEndpoint is empty",
@@ -225,6 +245,13 @@ func (r *StackitClusterReconciler) reconcileNormal(ctx context.Context, clusterS
 	}
 
 	if result, ready, err := r.reconcileBastion(ctx, cloudClient, clusterScope); err != nil {
+		log.Error(err, "Failed to reconcile bastion",
+			"cluster", stackitCluster.Name,
+		)
+		record.Warnf(
+			stackitCluster, "FailedCreateBastion",
+			"Failed to reconcile bastion: %v", err,
+		)
 		stackitCluster.Status.Ready = false
 		return util.CloudFailureResult(
 			&stackitCluster.Status.Conditions,
@@ -293,16 +320,20 @@ func bootstrapTargetIP(network *cloud.Network) string {
 }
 
 func (r *StackitClusterReconciler) reconcileDelete(ctx context.Context, clusterScope *scope.ClusterScope) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 	stackitCluster := clusterScope.StackitCluster
 
 	// Machines resolve their credentials and project context through this
 	// StackitCluster, so the finalizer has to stay while any of them remain.
 	machines, err := collections.GetFilteredMachinesForCluster(ctx, r.Client, clusterScope.Cluster)
 	if err != nil {
+		log.Error(err, "Failed to list Machines for cluster during deletion", "cluster", clusterScope.Cluster.Name)
+		record.Warnf(stackitCluster, "FailedListMachines",
+			"Failed to list Machines for cluster %s: %v", clusterScope.Cluster.Name, err)
 		return ctrl.Result{}, fmt.Errorf("list Machines for cluster %s: %w", clusterScope.Cluster.Name, err)
 	}
 	if machines.Len() > 0 {
-		logf.FromContext(ctx).Info(
+		log.Info(
 			"Waiting for Machines to be deleted before removing the StackitCluster finalizer",
 			"remainingMachines", machines.Len(),
 		)
@@ -319,14 +350,16 @@ func (r *StackitClusterReconciler) reconcileDelete(ctx context.Context, clusterS
 		// possible leak loud rather than stranding the cluster in Terminating.
 		// Every other credentials problem is fixable and keeps retrying.
 		if apierrors.IsNotFound(err) {
-			if r.Recorder != nil {
-				r.Recorder.Eventf(stackitCluster, nil, corev1.EventTypeWarning, "CleanupSkipped", "Delete",
-					"Credentials Secret is gone; finalizing without cloud cleanup. "+
-						"Any remaining STACKIT resources for this cluster must be removed manually: %v", err)
-			}
+			log.Error(err, "Credentials secret is gone; finalizing without cloud cleanup", "cluster", stackitCluster.Name)
+			record.Warnf(stackitCluster, "CleanupSkipped",
+				"Credentials Secret is gone; finalizing without cloud cleanup. "+
+					"Any remaining STACKIT resources for this cluster must be removed manually: %v", err)
 			controllerutil.RemoveFinalizer(stackitCluster, infrav1.ClusterFinalizer)
 			return ctrl.Result{}, nil
 		}
+		log.Error(err, "Failed to build cloud client for cluster deletion", "cluster", stackitCluster.Name)
+		record.Warnf(stackitCluster, "InvalidCredentials",
+			"Failed to build cloud client for deletion: %v", err)
 		util.SetConditions(
 			&stackitCluster.Status.Conditions,
 			stackitCluster.Generation,
@@ -339,21 +372,28 @@ func (r *StackitClusterReconciler) reconcileDelete(ctx context.Context, clusterS
 	}
 	loadBalancerID, err := loadbalancerservice.ResolveID(ctx, cloudClient, stackitCluster)
 	if err != nil {
+		log.Error(err, "Failed to resolve API server load balancer for deletion", "cluster", stackitCluster.Name)
+		record.Warnf(stackitCluster, "FailedResolveLoadBalancer",
+			"Failed to resolve API server load balancer: %v", err)
 		return ctrl.Result{}, err
 	}
 	if loadBalancerID != "" {
 		if err := cloudClient.DeleteAPIServerLoadBalancer(ctx, loadBalancerID); err != nil && !cloud.IsNotFound(err) {
+			log.Error(err, "Failed to delete API server load balancer", "cluster", stackitCluster.Name, "loadBalancerID", loadBalancerID)
+			record.Warnf(stackitCluster, "FailedDeleteLoadBalancer",
+				"Failed to delete API server load balancer %s: %v", loadBalancerID, err)
 			return ctrl.Result{}, err
 		}
 		stackitCluster.Status.APIServerLoadBalancerID = ""
-		if r.Recorder != nil {
-			r.Recorder.Eventf(
-				stackitCluster, nil, corev1.EventTypeNormal, "LoadBalancerDeleted", "Delete",
-				"Deleted API server load balancer %s", loadBalancerID,
-			)
-		}
+		record.Eventf(
+			stackitCluster, "LoadBalancerDeleted",
+			"Deleted API server load balancer %s", loadBalancerID,
+		)
 	}
 	if err := cloudClient.DeleteNodeSSHAccess(ctx, bastionservice.NodeSSHAccessTags(stackitCluster)); err != nil && !cloud.IsNotFound(err) {
+		log.Error(err, "Failed to delete bastion node SSH access", "cluster", stackitCluster.Name)
+		record.Warnf(stackitCluster, "FailedDeleteNodeSSHAccess",
+			"Failed to delete bastion node SSH access: %v", err)
 		return ctrl.Result{}, err
 	}
 	if err := cloudClient.DeleteBastion(ctx, bastionservice.Input(stackitCluster, nil), cloud.Bastion{
@@ -362,13 +402,14 @@ func (r *StackitClusterReconciler) reconcileDelete(ctx context.Context, clusterS
 		PublicIP:        stackitCluster.Status.Bastion.PublicIP,
 		SecurityGroupID: stackitCluster.Status.Bastion.SecurityGroupID,
 	}); err != nil && !cloud.IsNotFound(err) {
+		log.Error(err, "Failed to delete bastion", "cluster", stackitCluster.Name)
+		record.Warnf(stackitCluster, "FailedDeleteBastion",
+			"Failed to delete bastion: %v", err)
 		return ctrl.Result{}, err
 	}
 	if hasBastionStatus(stackitCluster.Status.Bastion) {
 		clusterScope.ClearBastionStatus()
-		if r.Recorder != nil {
-			r.Recorder.Eventf(stackitCluster, nil, corev1.EventTypeNormal, "BastionDeleted", "Delete", "Deleted bastion")
-		}
+		record.Event(stackitCluster, "BastionDeleted", "Deleted bastion")
 	}
 	controllerutil.RemoveFinalizer(stackitCluster, infrav1.ClusterFinalizer)
 	return ctrl.Result{}, nil

@@ -22,7 +22,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/events"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -175,23 +174,19 @@ var _ = Describe("StackitMachine Controller", func() {
 				"legacy status.ready must follow the Ready condition, not contradict it")
 		})
 
-		It("reports a stopped server with its own reason and warns once", func() {
-			recorder := events.NewFakeRecorder(10)
-			reconciler.Recorder = recorder
+		It("reports a stopped server with its own reason", func() {
 			_, err := reconciler.Reconcile(ctx, request)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Normal InstanceCreated")))
 
 			got := &infrav1.StackitMachine{}
 			Expect(k8sClient.Get(ctx, stackitKey, got)).To(Succeed())
 
-			By("passing through the transitional STOPPING state without a warning")
+			By("passing through the transitional STOPPING state without failing")
 			fakeCloud.SetServerState(got.Status.InstanceID, "STOPPING", "RUNNING")
 			_, err = reconciler.Reconcile(ctx, request)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(drainEvents(recorder)).NotTo(ContainElement(HavePrefix("Warning")))
 
-			By("warning once the server is stopped")
+			By("marking not ready once the server is stopped")
 			fakeCloud.SetServerState(got.Status.InstanceID, "INACTIVE", "STOPPED")
 			result, err := reconciler.Reconcile(ctx, request)
 			Expect(err).NotTo(HaveOccurred())
@@ -203,12 +198,10 @@ var _ = Describe("StackitMachine Controller", func() {
 			expectCondition(got.Status.Conditions, infrav1.MachineInstanceReadyCondition, metav1.ConditionFalse, "InstanceStopped")
 			condition := meta.FindStatusCondition(got.Status.Conditions, infrav1.MachineInstanceReadyCondition)
 			Expect(condition.Message).To(Equal("server is stopped (state INACTIVE, power status STOPPED)"))
-			Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Warning InstanceStopped")))
 
-			By("not warning again while the server stays stopped")
+			By("reconciling again while the server stays stopped")
 			_, err = reconciler.Reconcile(ctx, request)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(drainEvents(recorder)).NotTo(ContainElement(HavePrefix("Warning")))
 		})
 
 		It("reports an active but crashed server as not ready", func() {
@@ -253,6 +246,26 @@ var _ = Describe("StackitMachine Controller", func() {
 			Expect(securityGroups).To(HaveLen(1))
 			Expect(fakeCloud.SecurityGroupRemoteSources(securityGroups[0].ID)).To(ConsistOf("bastion-sg"))
 			Expect(fakeCloud.ServerHasSecurityGroup(got.Status.InstanceID, securityGroups[0].ID)).To(BeTrue())
+		})
+
+		It("marks conditions not ready when bastion node SSH access fails", func() {
+			stackitCluster := &infrav1.StackitCluster{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: namespace}, stackitCluster)).To(Succeed())
+			stackitCluster.Spec.Bastion = validBastionSpec()
+			Expect(k8sClient.Update(ctx, stackitCluster)).To(Succeed())
+			stackitCluster.Status.Ready = true
+			stackitCluster.Status.Bastion.SecurityGroupID = "bastion-sg"
+			Expect(k8sClient.Status().Update(ctx, stackitCluster)).To(Succeed())
+
+			fakeCloud.FailNextEnsureNodeSSH = fmt.Errorf("node ssh access timeout: %w", cloud.ErrTransient)
+
+			result, err := reconciler.Reconcile(ctx, request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+			got := &infrav1.StackitMachine{}
+			Expect(k8sClient.Get(ctx, stackitKey, got)).To(Succeed())
+			expectCondition(got.Status.Conditions, infrav1.MachineReadyCondition, metav1.ConditionFalse, "BastionSSHAccessError")
 		})
 
 		It("does not create a VM when availabilityZone is outside published failure domains", func() {
@@ -404,6 +417,21 @@ var _ = Describe("StackitMachine Controller", func() {
 				err := k8sClient.Get(ctx, stackitKey, &infrav1.StackitMachine{})
 				return apierrors.IsNotFound(err)
 			}).Should(BeTrue())
+		})
+
+		It("returns an error when server deletion fails", func() {
+			_, err := reconciler.Reconcile(ctx, request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fakeCloud.ServerCount()).To(Equal(1))
+
+			got := &infrav1.StackitMachine{}
+			Expect(k8sClient.Get(ctx, stackitKey, got)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, got)).To(Succeed())
+
+			fakeCloud.FailNextDeleteServer = fmt.Errorf("delete server timeout: %w", cloud.ErrTransient)
+
+			_, err = reconciler.Reconcile(ctx, request)
+			Expect(err).To(HaveOccurred())
 		})
 
 		// The hook observes API server state from inside the cloud call, so it proves

@@ -22,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -49,10 +50,13 @@ func (r *StackitMachineReconciler) reconcileNormal(ctx context.Context, machineS
 	}
 
 	if !machineScope.StackitCluster.Status.Ready {
+		log.Info("Waiting for StackitCluster to be ready", "machine", stackitMachine.Name, "cluster", machineScope.StackitCluster.Name)
 		machineScope.SetNotReady("InfrastructureNotReady", "waiting for StackitCluster to be ready", infrav1.MachineReadyCondition)
 		return ctrl.Result{}, nil
 	}
 	if err := validateMachineAvailabilityZone(machineScope); err != nil {
+		log.Error(err, "Invalid availability zone for machine", "machine", stackitMachine.Name, "availabilityZone", stackitMachine.Spec.AvailabilityZone)
+		record.Warnf(stackitMachine, "InvalidFailureDomain", "%v", err)
 		machineScope.SetNotReady(
 			"InvalidFailureDomain",
 			err.Error(),
@@ -65,6 +69,8 @@ func (r *StackitMachineReconciler) reconcileNormal(ctx context.Context, machineS
 	bootstrapData, conditionStatus, reason, message := r.fetchBootstrapData(ctx, machineScope.Machine)
 	machineScope.SetConditions(conditionStatus, reason, message, infrav1.MachineBootstrapReadyCondition)
 	if conditionStatus != metav1.ConditionTrue {
+		log.Error(errors.New(message), "Bootstrap data is not ready", "machine", stackitMachine.Name, "reason", reason)
+		record.Warnf(stackitMachine, reason, "Bootstrap data error: %s", message)
 		machineScope.SetConditions(metav1.ConditionFalse, reason, message, infrav1.MachineReadyCondition)
 		if reason == util.BootstrapReasonInvalid {
 			return ctrl.Result{}, nil
@@ -74,6 +80,8 @@ func (r *StackitMachineReconciler) reconcileNormal(ctx context.Context, machineS
 
 	cloudClient, err := util.BuildCloudClient(ctx, r.Client, r.CloudClientFactory, machineScope.StackitCluster)
 	if err != nil {
+		log.Error(err, "Failed to build cloud client for machine", "machine", stackitMachine.Name)
+		record.Warnf(stackitMachine, "InvalidCredentials", "Failed to build cloud client: %v", err)
 		return util.CredentialFailureResult(
 			&stackitMachine.Status.Conditions,
 			stackitMachine.Generation,
@@ -93,15 +101,25 @@ func (r *StackitMachineReconciler) reconcileNormal(ctx context.Context, machineS
 			infrav1.MachineInstanceReadyCondition,
 			infrav1.MachineReadyCondition,
 		)
-		if r.Recorder != nil {
-			r.Recorder.Eventf(
-				stackitMachine, nil, corev1.EventTypeWarning, "InstanceNotFound", "Reconcile",
-				"Server %s no longer exists; the Machine must be replaced", stackitMachine.Status.InstanceID,
-			)
-		}
+		record.Warnf(
+			stackitMachine, "InstanceNotFound",
+			"Server %s no longer exists; the Machine must be replaced", stackitMachine.Status.InstanceID,
+		)
 		return ctrl.Result{}, nil
 	}
 	if err != nil {
+		log.Error(err, "Failed to create server",
+			"machine", stackitMachine.Name,
+			"imageID", stackitMachine.Spec.ImageID,
+			"networkID", stackitMachine.Spec.Network.ID,
+			"region", machineScope.StackitCluster.Spec.Region,
+		)
+		record.Warnf(
+			stackitMachine, "FailedCreateInstance",
+			"Failed to create server %s (imageID: %s, networkID: %s, region: %s): %v",
+			stackitMachine.Name, stackitMachine.Spec.ImageID, stackitMachine.Spec.Network.ID,
+			machineScope.StackitCluster.Spec.Region, err,
+		)
 		machineScope.SetNotReady(
 			"InstanceError",
 			err.Error(),
@@ -119,9 +137,9 @@ func (r *StackitMachineReconciler) reconcileNormal(ctx context.Context, machineS
 			infrav1.MachineReadyCondition,
 		)
 	}
-	if created && r.Recorder != nil {
-		r.Recorder.Eventf(
-			stackitMachine, nil, corev1.EventTypeNormal, "InstanceCreated", "Create", "Created instance %s", server.ID,
+	if created {
+		record.Eventf(
+			stackitMachine, "InstanceCreated", "Created instance %s", server.ID,
 		)
 	}
 
@@ -136,13 +154,18 @@ func (r *StackitMachineReconciler) reconcileNormal(ctx context.Context, machineS
 		}
 		machineScope.SetNotReady(reason, message, infrav1.MachineInstanceReadyCondition, infrav1.MachineReadyCondition)
 		// Only warn on entering the state, not on every requeue.
-		if warn && r.Recorder != nil && previousReason != reason {
-			r.Recorder.Eventf(stackitMachine, nil, corev1.EventTypeWarning, reason, "Reconcile", "Server %s: %s", server.ID, message)
+		if warn && previousReason != reason {
+			record.Warnf(stackitMachine, reason, "Server %s: %s", server.ID, message)
 		}
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
 	if err := r.reconcileBastionNodeSSHAccess(ctx, cloudClient, machineScope, server); err != nil {
+		log.Error(err, "Failed to configure bastion SSH access for node", "machine", stackitMachine.Name)
+		record.Warnf(
+			stackitMachine, "FailedNodeSSHAccess",
+			"Failed to configure bastion SSH access for server %s: %v", server.ID, err,
+		)
 		machineScope.SetNotReady("BastionSSHAccessError", err.Error(), infrav1.MachineReadyCondition)
 		return util.CloudFailureResult(
 			&stackitMachine.Status.Conditions,
@@ -174,6 +197,7 @@ func validateMachineAvailabilityZone(machineScope *scope.MachineScope) error {
 }
 
 func (r *StackitMachineReconciler) reconcileDelete(ctx context.Context, machineScope *scope.MachineScope) error {
+	log := logf.FromContext(ctx)
 	stackitMachine := machineScope.StackitMachine
 
 	// An empty status.instanceID is not proof that no server exists, so every
@@ -185,14 +209,16 @@ func (r *StackitMachineReconciler) reconcileDelete(ctx context.Context, machineS
 		// possible leak loud rather than stranding the Machine in Terminating.
 		// Every other credentials problem is fixable and keeps retrying.
 		if apierrors.IsNotFound(err) {
-			if r.Recorder != nil {
-				r.Recorder.Eventf(stackitMachine, nil, corev1.EventTypeWarning, "CleanupSkipped", "Delete",
-					"Credentials Secret is gone; finalizing without cloud cleanup. "+
-						"Any remaining STACKIT server for this machine must be removed manually: %v", err)
-			}
+			log.Error(err, "Credentials secret is gone; finalizing without cloud cleanup", "machine", stackitMachine.Name)
+			record.Warnf(stackitMachine, "CleanupSkipped",
+				"Credentials Secret is gone; finalizing without cloud cleanup. "+
+					"Any remaining STACKIT server for this machine must be removed manually: %v", err)
 			controllerutil.RemoveFinalizer(stackitMachine, infrav1.MachineFinalizer)
 			return nil
 		}
+		log.Error(err, "Failed to build cloud client for machine deletion", "machine", stackitMachine.Name)
+		record.Warnf(stackitMachine, "InvalidCredentials",
+			"Failed to build cloud client for deletion: %v", err)
 		_, resultErr := util.CredentialFailureResult(
 			&stackitMachine.Status.Conditions,
 			stackitMachine.Generation,
@@ -202,20 +228,25 @@ func (r *StackitMachineReconciler) reconcileDelete(ctx context.Context, machineS
 		)
 		return resultErr
 	}
+
 	instanceID, err := r.resolveServerForDeletion(ctx, cloudClient, machineScope)
 	if err != nil {
+		log.Error(err, "Failed to resolve server for deletion", "machine", stackitMachine.Name)
+		record.Warnf(stackitMachine, "FailedResolveInstance",
+			"Failed to resolve server for deletion: %v", err)
 		return err
 	}
 	if instanceID != "" {
 		if err := cloudClient.DeleteServer(ctx, instanceID); err != nil && !cloud.IsNotFound(err) {
+			log.Error(err, "Failed to delete server", "machine", stackitMachine.Name, "instanceID", instanceID)
+			record.Warnf(stackitMachine, "FailedDeleteInstance",
+				"Failed to delete server %s: %v", instanceID, err)
 			return err
 		}
 		machineScope.ClearInstance()
-		if r.Recorder != nil {
-			r.Recorder.Eventf(
-				stackitMachine, nil, corev1.EventTypeNormal, "InstanceDeleted", "Delete", "Deleted instance %s", instanceID,
-			)
-		}
+		record.Eventf(
+			stackitMachine, "InstanceDeleted", "Deleted instance %s", instanceID,
+		)
 	}
 	controllerutil.RemoveFinalizer(stackitMachine, infrav1.MachineFinalizer)
 	return nil
