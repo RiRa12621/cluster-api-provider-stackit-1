@@ -47,8 +47,7 @@ type Client struct {
 	FailNextFindServer    error
 	FailNextEnsureLB      error
 	FailNextDeleteLB      error
-	FailNextEnsureTarget  error
-	FailNextDeleteTarget  error
+	FailNextSetTargets    error
 	FailNextGetNetwork    error
 	FailNextEnsureBastion error
 	FailNextDeleteBastion error
@@ -190,10 +189,15 @@ func (c *Client) CreateServer(_ context.Context, input cloud.CreateServerInput) 
 	}
 
 	id := c.genID()
+	zone := input.AvailabilityZone
+	if zone == "" {
+		zone = "eu01-1"
+	}
 	server := &cloud.Server{
-		ID:    id,
-		Name:  input.Name,
-		State: "ACTIVE",
+		ID:               id,
+		Name:             input.Name,
+		State:            "ACTIVE",
+		AvailabilityZone: zone,
 		Addresses: []cloud.Address{
 			{Type: "InternalIP", Address: "10.0.0.10"},
 		},
@@ -250,11 +254,12 @@ func (c *Client) EnsureBastion(_ context.Context, input cloud.BastionInput) (*cl
 			publicIP := c.publicIPByTags(input.Tags)
 			securityGroup := c.securityGroupByTags(input.Tags)
 			return &cloud.Bastion{
-				ServerID:        serverEntry.server.ID,
-				ServerState:     serverEntry.server.State,
-				PublicIPID:      idOfPublicIP(publicIP),
-				PublicIP:        ipOfPublicIP(publicIP),
-				SecurityGroupID: idOfSecurityGroup(securityGroup),
+				ServerID:          serverEntry.server.ID,
+				ServerState:       serverEntry.server.State,
+				ServerPowerStatus: serverEntry.server.PowerStatus,
+				PublicIPID:        idOfPublicIP(publicIP),
+				PublicIP:          ipOfPublicIP(publicIP),
+				SecurityGroupID:   idOfSecurityGroup(securityGroup),
 			}, nil
 		}
 	}
@@ -483,36 +488,37 @@ func (c *Client) ListAPIServerLoadBalancersByTags(
 	return loadBalancers, nil
 }
 
-func (c *Client) EnsureAPIServerLoadBalancerTarget(_ context.Context, input cloud.LoadBalancerTargetInput) error {
+func (c *Client) SetAPIServerLoadBalancerTargets(
+	_ context.Context,
+	loadBalancerID string,
+	port int32,
+	targets []cloud.LoadBalancerTargetInput,
+) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := consume(&c.FailNextEnsureTarget); err != nil {
+	if err := consume(&c.FailNextSetTargets); err != nil {
 		return err
 	}
-	entry, ok := c.loadBalancers[input.LoadBalancerID]
+	if loadBalancerID == "" || port <= 0 {
+		return fmt.Errorf("load balancer ID and target port are required: %w", cloud.ErrInvalidInput)
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("at least one target is required: %w", cloud.ErrInvalidInput)
+	}
+	entry, ok := c.loadBalancers[loadBalancerID]
 	if !ok {
-		return fmt.Errorf("load balancer %q: %w", input.LoadBalancerID, cloud.ErrNotFound)
+		return fmt.Errorf("load balancer %q: %w", loadBalancerID, cloud.ErrNotFound)
 	}
-	if entry.targets[bootstrapTargetName] == bootstrapTargetIP {
-		delete(entry.targets, bootstrapTargetName)
+	replaced := make(map[string]string, len(targets))
+	for _, target := range targets {
+		// The real API rejects these; accepting them would hide a regression.
+		if target.Name == "" || target.IP == "" {
+			return fmt.Errorf("target name and target IP are required: %w", cloud.ErrInvalidInput)
+		}
+		replaced[target.Name] = target.IP
 	}
-	entry.targets[input.Name] = input.IP
-	return nil
-}
-
-func (c *Client) DeleteAPIServerLoadBalancerTarget(_ context.Context, input cloud.LoadBalancerTargetInput) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if err := consume(&c.FailNextDeleteTarget); err != nil {
-		return err
-	}
-	entry, ok := c.loadBalancers[input.LoadBalancerID]
-	if !ok {
-		return fmt.Errorf("load balancer %q: %w", input.LoadBalancerID, cloud.ErrNotFound)
-	}
-	delete(entry.targets, input.Name)
+	entry.targets = replaced
 	return nil
 }
 
@@ -569,6 +575,16 @@ func (c *Client) ServerHasSecurityGroup(serverID, securityGroupID string) bool {
 	return ok
 }
 
+// SetServerState sets the state and power status of a fake server (test helper).
+func (c *Client) SetServerState(serverID, state, powerStatus string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.servers[serverID]; ok {
+		entry.server.State = state
+		entry.server.PowerStatus = powerStatus
+	}
+}
+
 // ServerUserData returns the user-data stored for a fake server.
 func (c *Client) ServerUserData(serverID string) []byte {
 	c.mu.Lock()
@@ -602,6 +618,26 @@ func (c *Client) LoadBalancerTargetCount(id string) int {
 		return 0
 	}
 	return len(entry.targets)
+}
+
+// LoadBalancerTargetIPs returns one target pool as name to IP (test helper).
+func (c *Client) LoadBalancerTargetIPs(id string) map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.loadBalancers[id]
+	if !ok {
+		return nil
+	}
+	return copyTags(entry.targets)
+}
+
+// SetLoadBalancerIP updates the IP of a load balancer (test helper).
+func (c *Client) SetLoadBalancerIP(id, ip string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.loadBalancers[id]; ok {
+		entry.lb.IP = ip
+	}
 }
 
 func mapContains(haystack, needle map[string]string) bool {

@@ -22,7 +22,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/cluster-api/util/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1 "github.com/stackitcloud/cluster-api-provider-stackit/api/v1alpha1"
 	"github.com/stackitcloud/cluster-api-provider-stackit/cloud"
@@ -39,6 +41,7 @@ func (r *StackitClusterReconciler) reconcileBastion(
 	cloudClient cloud.Client,
 	clusterScope *scope.ClusterScope,
 ) (ctrl.Result, bool, error) {
+	log := logf.FromContext(ctx)
 	stackitCluster := clusterScope.StackitCluster
 	input := bastionservice.Input(stackitCluster, nil)
 	status := cloud.Bastion{
@@ -61,9 +64,7 @@ func (r *StackitClusterReconciler) reconcileBastion(
 				return ctrl.Result{}, false, err
 			}
 			clusterScope.ClearBastionStatus()
-			if r.Recorder != nil {
-				r.Recorder.Eventf(stackitCluster, nil, corev1.EventTypeNormal, "BastionDeleted", "Delete", "Deleted bastion")
-			}
+			record.Event(stackitCluster, "BastionDeleted", "Deleted bastion")
 		}
 		clusterScope.SetConditions(
 			metav1.ConditionTrue,
@@ -75,6 +76,8 @@ func (r *StackitClusterReconciler) reconcileBastion(
 	}
 
 	if err := validateBastionSpec(stackitCluster.Spec.Bastion); err != nil {
+		log.Error(err, "Invalid bastion spec", "cluster", stackitCluster.Name)
+		record.Warnf(stackitCluster, "InvalidBastionSpec", "Invalid bastion spec: %v", err)
 		clusterScope.SetNotReady(
 			"InvalidBastionSpec",
 			err.Error(),
@@ -86,6 +89,8 @@ func (r *StackitClusterReconciler) reconcileBastion(
 
 	cloudInit, err := r.resolveBastionCloudInit(ctx, stackitCluster)
 	if err != nil {
+		log.Error(err, "Failed to resolve bastion cloud-init", "cluster", stackitCluster.Name)
+		record.Warnf(stackitCluster, "CloudInitRefError", "Failed to resolve bastion cloudInitRef: %v", err)
 		clusterScope.SetNotReady(
 			"CloudInitRefError",
 			err.Error(),
@@ -110,12 +115,10 @@ func (r *StackitClusterReconciler) reconcileBastion(
 			infrav1.ClusterBastionReadyCondition,
 			infrav1.ClusterReadyCondition,
 		)
-		if r.Recorder != nil {
-			r.Recorder.Eventf(
-				stackitCluster, nil, corev1.EventTypeNormal, "BastionRecreating", "Recreate",
-				"Recreating bastion because cloudInitRef content changed",
-			)
-		}
+		record.Event(
+			stackitCluster, "BastionRecreating",
+			"Recreating bastion because cloudInitRef content changed",
+		)
 		return ctrl.Result{RequeueAfter: retryableErrorRequeueAfter}, false, nil
 	}
 
@@ -125,18 +128,21 @@ func (r *StackitClusterReconciler) reconcileBastion(
 		return ctrl.Result{}, false, err
 	}
 	clusterScope.SetBastionStatus(bastion, bastionCloudInitHash(cloudInit))
-	if !hadBastionStatus && r.Recorder != nil {
-		r.Recorder.Eventf(
-			stackitCluster, nil, corev1.EventTypeNormal, "BastionCreated", "Create", "Created bastion %s", bastion.ServerID,
+	if !hadBastionStatus {
+		record.Eventf(
+			stackitCluster, "BastionCreated", "Created bastion %s", bastion.ServerID,
 		)
 	}
-	if bastion.ServerState != "" && bastion.ServerState != "ACTIVE" {
-		clusterScope.SetNotReady(
-			"Provisioning",
-			fmt.Sprintf("bastion server state is %s", bastion.ServerState),
-			infrav1.ClusterBastionReadyCondition,
-			infrav1.ClusterReadyCondition,
-		)
+	if ready, reason, message, warn := serverStateCondition(bastion.ServerState, bastion.ServerPowerStatus); !ready {
+		previousReason := ""
+		if previous := meta.FindStatusCondition(stackitCluster.Status.Conditions, infrav1.ClusterBastionReadyCondition); previous != nil {
+			previousReason = previous.Reason
+		}
+		clusterScope.SetNotReady(reason, "bastion "+message, infrav1.ClusterBastionReadyCondition, infrav1.ClusterReadyCondition)
+		// Only warn on entering the state, not on every requeue.
+		if warn && previousReason != reason {
+			record.Warnf(stackitCluster, reason, "Bastion server %s: %s", bastion.ServerID, message)
+		}
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, false, nil
 	}
 	if bastion.PublicIP == "" {
